@@ -18,6 +18,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+
+#define MAVLINK_COMM_NUM_BUFFERS 1
+#include "common/mavlink.h"
+#include "standard/mavlink_msg_global_position_int.h"
 
 #define REG32(address) (*(volatile uint32_t *)(address))
 
@@ -44,6 +49,8 @@
 #define SYST_RVR REG32(0xE000E014UL)
 #define SYST_CVR REG32(0xE000E018UL)
 
+#define SCB_CPACR REG32(0xE000ED88UL)
+
 #define HSI_HZ (16000000UL)
 #define DEBUG_UART_BAUD (115200UL)
 
@@ -59,15 +66,62 @@
 #define SYST_CSR_CLKSOURCE (1UL << 2)
 #define SYST_CSR_COUNTFLAG (1UL << 16)
 
-#define MAVLINK_STX_V2 (0xFD)
-#define MAVLINK_MSG_ID_HEARTBEAT (0U)
-#define MAVLINK_MSG_HEARTBEAT_LEN (9U)
-#define MAVLINK_MSG_HEARTBEAT_CRC_EXTRA (50U)
+#define SCB_CPACR_CP10_CP11_FULL_ACCESS (0xFUL << 20)
 
-static uint8_t mavlink_sequence;
+#define MAVLINK_SYSTEM_ID (1U)
+#define MAVLINK_COMPONENT_ID MAV_COMP_ID_AUTOPILOT1
+
+#define HEARTBEAT_PERIOD_MS (1000UL)
+#define SYS_STATUS_PERIOD_MS (1000UL)
+#define BATTERY_STATUS_PERIOD_MS (1000UL)
+#define ATTITUDE_PERIOD_MS (100UL)
+#define POSITION_PERIOD_MS (200UL)
+#define GPS_RAW_PERIOD_MS (200UL)
+
+/* Set this to 0 once telemetry_read_sample() is wired to real sensors. */
+#define MAVLINK_SEND_DEMO_TELEMETRY (1)
+
+typedef struct {
+    uint8_t has_attitude;
+    float roll_rad;
+    float pitch_rad;
+    float yaw_rad;
+    float rollspeed_rad_s;
+    float pitchspeed_rad_s;
+    float yawspeed_rad_s;
+
+    uint8_t has_global_position;
+    int32_t latitude_deg_e7;
+    int32_t longitude_deg_e7;
+    int32_t altitude_msl_mm;
+    int32_t relative_altitude_mm;
+    int16_t velocity_north_cms;
+    int16_t velocity_east_cms;
+    int16_t velocity_down_cms;
+    uint16_t heading_cdeg;
+
+    uint8_t has_gps;
+    uint8_t gps_fix_type;
+    uint8_t satellites_visible;
+    uint16_t gps_hdop;
+    uint16_t gps_vdop;
+    uint16_t gps_ground_speed_cms;
+    uint16_t gps_course_cdeg;
+
+    uint8_t has_battery;
+    uint16_t battery_voltage_mv;
+    int16_t battery_current_ca;
+    int8_t battery_remaining_percent;
+    int16_t battery_temperature_cdeg;
+} TelemetrySample;
+
+static uint32_t boot_time_ms;
 
 void SystemInit(void)
 {
+    SCB_CPACR |= SCB_CPACR_CP10_CP11_FULL_ACCESS;
+    __asm volatile("dsb");
+    __asm volatile("isb");
 }
 
 static void debug_uart_init(void)
@@ -120,69 +174,234 @@ static void systick_init_1ms(void)
     SYST_CSR = SYST_CSR_CLKSOURCE | SYST_CSR_ENABLE;
 }
 
-static void delay_ms(uint32_t milliseconds)
+static void wait_next_millisecond(void)
 {
-    while (milliseconds > 0U) {
-        while ((SYST_CSR & SYST_CSR_COUNTFLAG) == 0U) {
-        }
-
-        milliseconds--;
+    while ((SYST_CSR & SYST_CSR_COUNTFLAG) == 0U) {
     }
+
+    boot_time_ms++;
 }
 
-static void mavlink_crc_accumulate(uint8_t data, uint16_t *crc)
+static void mavlink_write_message(const mavlink_message_t *message)
 {
-    uint8_t tmp = data ^ (uint8_t)(*crc & 0xFFU);
-    tmp ^= (uint8_t)(tmp << 4U);
-    *crc = (*crc >> 8U) ^ ((uint16_t)tmp << 8U) ^
-           ((uint16_t)tmp << 3U) ^ ((uint16_t)tmp >> 4U);
+    uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+    uint16_t length = mavlink_msg_to_send_buffer(buffer, message);
+
+    debug_uart_write(buffer, length);
+}
+
+static uint32_t mav_sensor_status_flags(const TelemetrySample *sample)
+{
+    uint32_t flags = 0;
+
+    if (sample->has_attitude != 0U) {
+        flags |= MAV_SYS_STATUS_SENSOR_3D_GYRO |
+                 MAV_SYS_STATUS_SENSOR_3D_ACCEL |
+                 MAV_SYS_STATUS_AHRS;
+    }
+
+    if (sample->has_gps != 0U) {
+        flags |= MAV_SYS_STATUS_SENSOR_GPS;
+    }
+
+    if (sample->has_battery != 0U) {
+        flags |= MAV_SYS_STATUS_SENSOR_BATTERY;
+    }
+
+    return flags;
 }
 
 static void mavlink_send_heartbeat(void)
 {
-    uint8_t frame[10U + MAVLINK_MSG_HEARTBEAT_LEN + 2U];
-    size_t index = 0;
+    mavlink_message_t message;
 
-    frame[index++] = MAVLINK_STX_V2;
-    frame[index++] = MAVLINK_MSG_HEARTBEAT_LEN;
-    frame[index++] = 0; /* incompat_flags */
-    frame[index++] = 0; /* compat_flags */
-    frame[index++] = mavlink_sequence++;
-    frame[index++] = 1; /* system id */
-    frame[index++] = 1; /* component id */
-    frame[index++] = (uint8_t)(MAVLINK_MSG_ID_HEARTBEAT & 0xFFU);
-    frame[index++] = (uint8_t)((MAVLINK_MSG_ID_HEARTBEAT >> 8U) & 0xFFU);
-    frame[index++] = (uint8_t)((MAVLINK_MSG_ID_HEARTBEAT >> 16U) & 0xFFU);
+    mavlink_msg_heartbeat_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID,
+                               &message, MAV_TYPE_GENERIC,
+                               MAV_AUTOPILOT_GENERIC, 0, 0,
+                               MAV_STATE_STANDBY);
+    mavlink_write_message(&message);
+}
 
-    frame[index++] = 0; /* custom_mode */
-    frame[index++] = 0;
-    frame[index++] = 0;
-    frame[index++] = 0;
-    frame[index++] = 0; /* MAV_TYPE_GENERIC */
-    frame[index++] = 8; /* MAV_AUTOPILOT_INVALID */
-    frame[index++] = 0; /* base_mode */
-    frame[index++] = 3; /* MAV_STATE_STANDBY */
-    frame[index++] = 3; /* MAVLink version */
+static void mavlink_send_sys_status(const TelemetrySample *sample)
+{
+    mavlink_message_t message;
+    uint32_t sensors = mav_sensor_status_flags(sample);
+    uint16_t voltage = UINT16_MAX;
+    int16_t current = -1;
+    int8_t remaining = -1;
 
-    uint16_t crc = 0xFFFFU;
-    for (size_t i = 1; i < index; i++) {
-        mavlink_crc_accumulate(frame[i], &crc);
+    if (sample->has_battery != 0U) {
+        voltage = sample->battery_voltage_mv;
+        current = sample->battery_current_ca;
+        remaining = sample->battery_remaining_percent;
     }
-    mavlink_crc_accumulate(MAVLINK_MSG_HEARTBEAT_CRC_EXTRA, &crc);
 
-    frame[index++] = (uint8_t)(crc & 0xFFU);
-    frame[index++] = (uint8_t)(crc >> 8U);
+    mavlink_msg_sys_status_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID,
+                                &message, sensors, sensors, sensors, 0,
+                                voltage, current, remaining, 0, 0, 0, 0, 0,
+                                0, 0, 0, 0);
+    mavlink_write_message(&message);
+}
 
-    debug_uart_write(frame, index);
+static void mavlink_send_attitude(const TelemetrySample *sample)
+{
+    mavlink_message_t message;
+
+    mavlink_msg_attitude_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID,
+                              &message, boot_time_ms, sample->roll_rad,
+                              sample->pitch_rad, sample->yaw_rad,
+                              sample->rollspeed_rad_s,
+                              sample->pitchspeed_rad_s,
+                              sample->yawspeed_rad_s);
+    mavlink_write_message(&message);
+}
+
+static void mavlink_send_global_position_int(const TelemetrySample *sample)
+{
+    mavlink_message_t message;
+
+    mavlink_msg_global_position_int_pack(
+        MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &message, boot_time_ms,
+        sample->latitude_deg_e7, sample->longitude_deg_e7,
+        sample->altitude_msl_mm, sample->relative_altitude_mm,
+        sample->velocity_north_cms, sample->velocity_east_cms,
+        sample->velocity_down_cms, sample->heading_cdeg);
+    mavlink_write_message(&message);
+}
+
+static void mavlink_send_gps_raw_int(const TelemetrySample *sample)
+{
+    mavlink_message_t message;
+    uint64_t time_usec = (uint64_t)boot_time_ms * 1000ULL;
+
+    mavlink_msg_gps_raw_int_pack(
+        MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &message, time_usec,
+        sample->gps_fix_type, sample->latitude_deg_e7,
+        sample->longitude_deg_e7, sample->altitude_msl_mm, sample->gps_hdop,
+        sample->gps_vdop, sample->gps_ground_speed_cms,
+        sample->gps_course_cdeg, sample->satellites_visible, 0, 0, 0, 0, 0,
+        UINT16_MAX);
+    mavlink_write_message(&message);
+}
+
+static void mavlink_send_battery_status(const TelemetrySample *sample)
+{
+    mavlink_message_t message;
+    uint16_t voltages[10];
+    uint16_t voltages_ext[4] = {0};
+
+    voltages[0] = sample->battery_voltage_mv;
+    for (size_t i = 1; i < 10U; i++) {
+        voltages[i] = UINT16_MAX;
+    }
+
+    mavlink_msg_battery_status_pack(
+        MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &message, 0,
+        MAV_BATTERY_FUNCTION_UNKNOWN, MAV_BATTERY_TYPE_UNKNOWN,
+        sample->battery_temperature_cdeg, voltages,
+        sample->battery_current_ca, -1, -1, sample->battery_remaining_percent,
+        0, MAV_BATTERY_CHARGE_STATE_UNDEFINED, voltages_ext,
+        MAV_BATTERY_MODE_UNKNOWN, 0);
+    mavlink_write_message(&message);
+}
+
+static void telemetry_read_sample(TelemetrySample *sample)
+{
+    memset(sample, 0, sizeof(*sample));
+
+#if MAVLINK_SEND_DEMO_TELEMETRY
+    uint16_t heading = (uint16_t)((boot_time_ms / 10UL) % 36000UL);
+
+    sample->has_attitude = 1;
+    sample->roll_rad = 0.01f;
+    sample->pitch_rad = -0.02f;
+    sample->yaw_rad = (float)heading * 0.00017453293f;
+    sample->rollspeed_rad_s = 0.0f;
+    sample->pitchspeed_rad_s = 0.0f;
+    sample->yawspeed_rad_s = 0.01f;
+
+    sample->has_global_position = 1;
+    sample->latitude_deg_e7 = 387369460;
+    sample->longitude_deg_e7 = -91426850;
+    sample->altitude_msl_mm = 120000;
+    sample->relative_altitude_mm = 10000;
+    sample->velocity_north_cms = 0;
+    sample->velocity_east_cms = 0;
+    sample->velocity_down_cms = 0;
+    sample->heading_cdeg = heading;
+
+    sample->has_gps = 1;
+    sample->gps_fix_type = GPS_FIX_TYPE_3D_FIX;
+    sample->satellites_visible = 10;
+    sample->gps_hdop = 90;
+    sample->gps_vdop = 130;
+    sample->gps_ground_speed_cms = 0;
+    sample->gps_course_cdeg = heading;
+
+    sample->has_battery = 1;
+    sample->battery_voltage_mv = 12000;
+    sample->battery_current_ca = 0;
+    sample->battery_remaining_percent = 95;
+    sample->battery_temperature_cdeg = INT16_MAX;
+#endif
+}
+
+static uint8_t time_reached(uint32_t now, uint32_t deadline)
+{
+    return ((int32_t)(now - deadline) >= 0) ? 1U : 0U;
 }
 
 int main(void)
 {
+    TelemetrySample telemetry;
+    uint32_t next_heartbeat_ms = 0;
+    uint32_t next_sys_status_ms = 0;
+    uint32_t next_battery_status_ms = 0;
+    uint32_t next_attitude_ms = 0;
+    uint32_t next_position_ms = 0;
+    uint32_t next_gps_raw_ms = 0;
+
     debug_uart_init();
     systick_init_1ms();
 
     for (;;) {
-        mavlink_send_heartbeat();
-        delay_ms(1000);
+        telemetry_read_sample(&telemetry);
+        uint32_t now = boot_time_ms;
+
+        if (time_reached(now, next_heartbeat_ms) != 0U) {
+            mavlink_send_heartbeat();
+            next_heartbeat_ms = now + HEARTBEAT_PERIOD_MS;
+        }
+
+        if (time_reached(now, next_sys_status_ms) != 0U) {
+            mavlink_send_sys_status(&telemetry);
+            next_sys_status_ms = now + SYS_STATUS_PERIOD_MS;
+        }
+
+        if ((telemetry.has_battery != 0U) &&
+            (time_reached(now, next_battery_status_ms) != 0U)) {
+            mavlink_send_battery_status(&telemetry);
+            next_battery_status_ms = now + BATTERY_STATUS_PERIOD_MS;
+        }
+
+        if ((telemetry.has_attitude != 0U) &&
+            (time_reached(now, next_attitude_ms) != 0U)) {
+            mavlink_send_attitude(&telemetry);
+            next_attitude_ms = now + ATTITUDE_PERIOD_MS;
+        }
+
+        if ((telemetry.has_global_position != 0U) &&
+            (time_reached(now, next_position_ms) != 0U)) {
+            mavlink_send_global_position_int(&telemetry);
+            next_position_ms = now + POSITION_PERIOD_MS;
+        }
+
+        if ((telemetry.has_gps != 0U) &&
+            (time_reached(now, next_gps_raw_ms) != 0U)) {
+            mavlink_send_gps_raw_int(&telemetry);
+            next_gps_raw_ms = now + GPS_RAW_PERIOD_MS;
+        }
+
+        wait_next_millisecond();
     }
 }
