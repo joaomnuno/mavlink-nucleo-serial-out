@@ -216,7 +216,7 @@ static void mavlink_send_heartbeat(void)
     mavlink_message_t message;
 
     mavlink_msg_heartbeat_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID,
-                               &message, MAV_TYPE_GENERIC,
+                               &message, MAV_TYPE_ROCKET,
                                MAV_AUTOPILOT_GENERIC, 0, 0,
                                MAV_STATE_STANDBY);
     mavlink_write_message(&message);
